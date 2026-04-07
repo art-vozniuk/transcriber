@@ -9,6 +9,7 @@ import torchaudio
 import mlx_whisper
 from pyannote.audio import Pipeline as PyannotePipeline
 
+SAMPLE_RATE = 16_000
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -79,23 +80,110 @@ class TranscriptionPipeline:
         self.whisper_model = whisper_model
         self._diarizer: PyannotePipeline | None = None
 
+    # ── VAD ─────────────────────────────────────────────────────────────────────
+
+    def _get_vad_segments(
+        self, audio: np.ndarray, sr: int = SAMPLE_RATE
+    ) -> list[dict]:
+        """
+        Use Silero VAD to find speech regions.
+        Returns list of {"start": float, "end": float} in seconds.
+        """
+        model, utils = torch.hub.load(
+            "snakers4/silero-vad", "silero_vad", trust_repo=True
+        )
+        get_speech_timestamps = utils[0]
+
+        wav = torch.from_numpy(audio)
+        stamps = get_speech_timestamps(
+            wav, model,
+            sampling_rate=sr,
+            threshold=0.35,
+            min_speech_duration_ms=250,
+            max_speech_duration_s=15,
+            min_silence_duration_ms=200,
+            speech_pad_ms=200,
+        )
+        return [
+            {"start": s["start"] / sr, "end": s["end"] / sr}
+            for s in stamps
+        ]
+
     # ── transcription ─────────────────────────────────────────────────────────
 
     def transcribe(self, audio: np.ndarray, language: str | None = None) -> list[dict]:
         """
-        Run MLX-Whisper on a float32 numpy array (16 kHz mono).
-        Passing an ndarray skips mlx_whisper's internal ffmpeg call entirely.
+        Run Silero VAD to find speech chunks, then transcribe each chunk
+        with MLX-Whisper. This produces shorter, more accurate segments.
         """
-        kwargs: dict = {
+        PROMPTS = {
+            "ru": "Привет! Как дела? Да, всё хорошо. Ну, в общем, вот так.",
+            "en": "Hello! How are you? Yes, everything is fine. Well, that's how it is.",
+        }
+
+        base_kwargs: dict = {
             "path_or_hf_repo": self.whisper_model,
             "word_timestamps": True,
             "verbose": False,
+            "condition_on_previous_text": False,
         }
         if language:
-            kwargs["language"] = language
+            base_kwargs["language"] = language
+            if language in PROMPTS:
+                base_kwargs["initial_prompt"] = PROMPTS[language]
 
-        result = mlx_whisper.transcribe(audio, **kwargs)
-        return result.get("segments", [])
+        # Get speech regions via VAD
+        vad_regions = self._get_vad_segments(audio)
+
+        # Merge nearby VAD regions so short chunks get enough context.
+        merged_regions = []
+        for r in vad_regions:
+            if merged_regions and r["start"] - merged_regions[-1]["end"] < 0.3:
+                merged_regions[-1]["end"] = r["end"]
+            else:
+                merged_regions.append(dict(r))
+
+        all_segments: list[dict] = []
+        for region in merged_regions:
+            start_sample = int(region["start"] * SAMPLE_RATE)
+            end_sample = int(region["end"] * SAMPLE_RATE)
+            chunk = audio[start_sample:end_sample]
+
+            if len(chunk) < SAMPLE_RATE * 0.3:
+                continue
+
+            result = mlx_whisper.transcribe(chunk, **base_kwargs)
+            for seg in result.get("segments", []):
+                seg["start"] += region["start"]
+                seg["end"] += region["start"]
+                for w in seg.get("words", []):
+                    w["start"] = w.get("start", 0) + region["start"]
+                    w["end"] = w.get("end", 0) + region["start"]
+                all_segments.append(seg)
+
+        return self._filter_hallucinations(all_segments)
+
+    # ── hallucination filtering ─────────────────────────────────────────────
+
+    @staticmethod
+    def _filter_hallucinations(segments: list[dict]) -> list[dict]:
+        """Remove segments that are likely hallucinated."""
+        filtered = []
+        for seg in segments:
+            # Skip segments where Whisper thinks there's no speech
+            if seg.get("no_speech_prob", 0) > 0.6:
+                continue
+            # Skip highly repetitive segments (hallucination loops)
+            if seg.get("compression_ratio", 0) > 2.4:
+                continue
+            # Skip segments where the model is very uncertain
+            if seg.get("avg_logprob", 0) < -1.0:
+                continue
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+            filtered.append(seg)
+        return filtered
 
     # ── diarization ───────────────────────────────────────────────────────────
 
@@ -115,7 +203,7 @@ class TranscriptionPipeline:
         segments: list[dict],
         num_speakers: int | None = None,
     ) -> list[dict]:
-        """Assign speaker labels to each Whisper segment."""
+        """Assign speaker labels at word level, then group into segments."""
         diarizer = self._load_diarizer()
 
         kwargs: dict = {}
@@ -123,8 +211,7 @@ class TranscriptionPipeline:
             kwargs["num_speakers"] = num_speakers
         annotation = diarizer(audio_path, **kwargs)
 
-        # pyannote 4.x wraps the result in DiarizeOutput with field
-        # 'speaker_diarization'; older versions return an Annotation directly.
+        # pyannote 4.x wraps the result in DiarizeOutput
         if hasattr(annotation, "speaker_diarization"):
             diarization = annotation.speaker_diarization
         elif hasattr(annotation, "annotation"):
@@ -138,42 +225,92 @@ class TranscriptionPipeline:
             for turn, _, spk in diarization.itertracks(yield_label=True)
         ]
 
-        labeled: list[dict] = []
+        # Assign speaker to each word individually
+        labeled_words: list[dict] = []
         for seg in segments:
-            seg_start, seg_end = seg["start"], seg["end"]
+            for w in seg.get("words", []):
+                w_start = w.get("start", seg["start"])
+                w_end = w.get("end", seg["end"])
+                word_text = w.get("word", "").strip()
+                if not word_text:
+                    continue
 
-            # Assign the speaker with the greatest time overlap in this segment
-            speaker_scores: dict[str, float] = {}
-            for t_start, t_end, spk in speaker_turns:
-                ov = _overlap(seg_start, seg_end, t_start, t_end)
-                if ov > 0:
-                    speaker_scores[spk] = speaker_scores.get(spk, 0.0) + ov
+                # Find speaker with max overlap for this word
+                best_spk = "SPEAKER_00"
+                best_ov = 0.0
+                for t_start, t_end, spk in speaker_turns:
+                    ov = _overlap(w_start, w_end, t_start, t_end)
+                    if ov > best_ov:
+                        best_ov = ov
+                        best_spk = spk
 
-            speaker = (
-                max(speaker_scores, key=speaker_scores.get)
-                if speaker_scores
-                else "SPEAKER_00"
-            )
+                labeled_words.append({
+                    "start": w_start,
+                    "end": w_end,
+                    "text": word_text,
+                    "speaker": best_spk,
+                })
 
-            labeled.append(
-                {
-                    "start": seg_start,
-                    "end": seg_end,
-                    "text": seg["text"].strip(),
-                    "speaker": speaker,
-                    "words": seg.get("words", []),
+        # Smooth speaker flickering: if a run of 1-2 words has a different
+        # speaker than both neighbors, reassign to the surrounding speaker.
+        for i in range(len(labeled_words)):
+            if i == 0 or i == len(labeled_words) - 1:
+                continue
+            cur_spk = labeled_words[i]["speaker"]
+            prev_spk = labeled_words[i - 1]["speaker"]
+            # Look ahead to find next different-speaker boundary
+            j = i
+            while j < len(labeled_words) and labeled_words[j]["speaker"] == cur_spk:
+                j += 1
+            run_len = j - i
+            if run_len <= 2 and prev_spk != cur_spk:
+                next_spk = labeled_words[j]["speaker"] if j < len(labeled_words) else prev_spk
+                if prev_spk == next_spk:
+                    for k in range(i, j):
+                        labeled_words[k]["speaker"] = prev_spk
+
+        # Group consecutive words by speaker into segments
+        if not labeled_words:
+            return []
+
+        grouped: list[dict] = []
+        cur = {
+            "start": labeled_words[0]["start"],
+            "end": labeled_words[0]["end"],
+            "text": labeled_words[0]["text"],
+            "speaker": labeled_words[0]["speaker"],
+            "words": [labeled_words[0]],
+        }
+        for w in labeled_words[1:]:
+            if w["speaker"] == cur["speaker"]:
+                cur["end"] = w["end"]
+                cur["text"] += " " + w["text"]
+                cur["words"].append(w)
+            else:
+                grouped.append(cur)
+                cur = {
+                    "start": w["start"],
+                    "end": w["end"],
+                    "text": w["text"],
+                    "speaker": w["speaker"],
+                    "words": [w],
                 }
-            )
+        grouped.append(cur)
 
-        return self._merge_consecutive(labeled, max_gap=2.0)
+        return self._merge_consecutive(grouped)
 
     # ── post-processing ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _merge_consecutive(segments: list[dict], max_gap: float = 2.0) -> list[dict]:
+    def _merge_consecutive(
+        segments: list[dict],
+        max_gap: float = 1.5,
+        max_duration: float = 30.0,
+        max_words: int = 50,
+    ) -> list[dict]:
         """
-        Merge adjacent segments from the same speaker when the silence gap
-        between them is shorter than *max_gap* seconds.
+        Merge adjacent segments from the same speaker, respecting limits
+        on gap duration, total segment length, and word count.
         """
         if not segments:
             return segments
@@ -182,7 +319,17 @@ class TranscriptionPipeline:
         for seg in segments[1:]:
             prev = merged[-1]
             gap = seg["start"] - prev["end"]
-            if seg["speaker"] == prev["speaker"] and gap <= max_gap:
+            prev_duration = prev["end"] - prev["start"]
+            prev_word_count = len(prev.get("words", []))
+
+            can_merge = (
+                seg["speaker"] == prev["speaker"]
+                and gap <= max_gap
+                and prev_duration < max_duration
+                and prev_word_count < max_words
+            )
+
+            if can_merge:
                 prev["end"] = seg["end"]
                 prev["text"] += " " + seg["text"]
                 prev["words"].extend(seg.get("words", []))
