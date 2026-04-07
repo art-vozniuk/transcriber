@@ -1,0 +1,7 @@
+mlx-whisper>=0.4.1
+pyannote.audio>=3.3.2
+torch>=2.2.0
+torchaudio>=2.2.0
+gradio>=4.40.0
+python-dotenv>=1.0.0
+numpy>=1.24.0
