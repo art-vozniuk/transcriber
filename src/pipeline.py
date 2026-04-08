@@ -9,6 +9,8 @@ import torchaudio
 import mlx_whisper
 from pyannote.audio import Pipeline as PyannotePipeline
 
+from src.model_cache import hf_repo_is_cached, torch_hub_repo_is_cached
+
 SAMPLE_RATE = 16_000
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -23,6 +25,16 @@ def _best_device() -> torch.device:
 def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
     """Return the duration of the overlap between two time intervals."""
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def _emit_status(
+    on_status: callable | None,
+    stage_key: str,
+    title: str,
+    detail: str,
+) -> None:
+    if on_status:
+        on_status(stage_key, title, detail)
 
 
 def _load_audio_np(audio_path: str, target_sr: int = 16_000) -> np.ndarray:
@@ -87,12 +99,37 @@ class TranscriptionPipeline:
     # ── VAD ─────────────────────────────────────────────────────────────────────
 
     def _get_vad_segments(
-        self, audio: np.ndarray, sr: int = SAMPLE_RATE
+        self,
+        audio: np.ndarray,
+        sr: int = SAMPLE_RATE,
+        on_status: callable | None = None,
     ) -> list[dict]:
         """
         Use Silero VAD to find speech regions.
         Returns list of {"start": float, "end": float} in seconds.
         """
+        vad_repo = "snakers4_silero-vad_master"
+        if torch_hub_repo_is_cached(vad_repo):
+            _emit_status(
+                on_status,
+                "vad_model",
+                "Voice activity detection model",
+                "Using cached Torch Hub repo snakers4/silero-vad",
+            )
+        else:
+            _emit_status(
+                on_status,
+                "vad_model",
+                "Voice activity detection model",
+                "Downloading Torch Hub repo snakers4/silero-vad",
+            )
+
+        _emit_status(
+            on_status,
+            "vad",
+            "Voice activity detection",
+            "Running Silero VAD on the full audio stream",
+        )
         model, utils = torch.hub.load(
             "snakers4/silero-vad", "silero_vad", trust_repo=True
         )
@@ -150,7 +187,12 @@ class TranscriptionPipeline:
 
         return " ".join(parts) if parts else None
 
-    def transcribe(self, audio: np.ndarray, language: str | None = None) -> list[dict]:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        language: str | None = None,
+        on_status: callable | None = None,
+    ) -> list[dict]:
         """
         Run Silero VAD to find speech chunks, then transcribe each chunk
         with MLX-Whisper. This produces shorter, more accurate segments.
@@ -169,7 +211,7 @@ class TranscriptionPipeline:
             base_kwargs["initial_prompt"] = prompt
 
         # Get speech regions via VAD
-        vad_regions = self._get_vad_segments(audio)
+        vad_regions = self._get_vad_segments(audio, on_status=on_status)
 
         # Merge nearby VAD regions so short chunks get enough context.
         merged_regions = []
@@ -179,8 +221,34 @@ class TranscriptionPipeline:
             else:
                 merged_regions.append(dict(r))
 
+        _emit_status(
+            on_status,
+            "vad",
+            "Voice activity detection",
+            (
+                f"Detected {len(vad_regions)} speech regions and merged them "
+                f"into {len(merged_regions)} transcription chunks"
+            ),
+        )
+
+        if hf_repo_is_cached(self.whisper_model):
+            _emit_status(
+                on_status,
+                "whisper_model",
+                "Whisper model",
+                f"Using cached model {self.whisper_model}",
+            )
+        else:
+            _emit_status(
+                on_status,
+                "whisper_model",
+                "Whisper model",
+                f"Downloading model {self.whisper_model}",
+            )
+
         all_segments: list[dict] = []
-        for region in merged_regions:
+        total_chunks = len(merged_regions)
+        for idx, region in enumerate(merged_regions, start=1):
             start_sample = int(region["start"] * SAMPLE_RATE)
             end_sample = int(region["end"] * SAMPLE_RATE)
             chunk = audio[start_sample:end_sample]
@@ -188,6 +256,16 @@ class TranscriptionPipeline:
             if len(chunk) < SAMPLE_RATE * 0.3:
                 continue
 
+            chunk_duration = len(chunk) / SAMPLE_RATE
+            _emit_status(
+                on_status,
+                "transcribe",
+                "Transcription",
+                (
+                    f"Transcribing chunk {idx}/{total_chunks} "
+                    f"({chunk_duration:.1f}s, {len(chunk):,} samples)"
+                ),
+            )
             result = mlx_whisper.transcribe(chunk, **base_kwargs)
             for seg in result.get("segments", []):
                 seg["start"] += region["start"]
@@ -197,7 +275,17 @@ class TranscriptionPipeline:
                     w["end"] = w.get("end", 0) + region["start"]
                 all_segments.append(seg)
 
-        return self._filter_hallucinations(all_segments)
+        filtered = self._filter_hallucinations(all_segments)
+        _emit_status(
+            on_status,
+            "transcribe",
+            "Transcription",
+            (
+                f"Finished {total_chunks} chunks and kept "
+                f"{len(filtered)} transcript segments after filtering"
+            ),
+        )
+        return filtered
 
     # ── hallucination filtering ─────────────────────────────────────────────
 
@@ -223,14 +311,35 @@ class TranscriptionPipeline:
 
     # ── diarization ───────────────────────────────────────────────────────────
 
-    def _load_diarizer(self) -> PyannotePipeline:
+    def _load_diarizer(self, on_status: callable | None = None) -> PyannotePipeline:
         """Lazy-load and cache the pyannote diarization pipeline."""
         if self._diarizer is None:
+            if hf_repo_is_cached(self.DIARIZATION_MODEL):
+                _emit_status(
+                    on_status,
+                    "diarizer_model",
+                    "Speaker diarization model",
+                    f"Using cached model {self.DIARIZATION_MODEL}",
+                )
+            else:
+                _emit_status(
+                    on_status,
+                    "diarizer_model",
+                    "Speaker diarization model",
+                    f"Downloading model {self.DIARIZATION_MODEL}",
+                )
             self._diarizer = PyannotePipeline.from_pretrained(
                 self.DIARIZATION_MODEL,
                 token=self.hf_token,
             )
             self._diarizer.to(_best_device())
+        else:
+            _emit_status(
+                on_status,
+                "diarizer_model",
+                "Speaker diarization model",
+                f"Using in-memory pipeline {self.DIARIZATION_MODEL}",
+            )
         return self._diarizer
 
     def diarize(
@@ -238,13 +347,23 @@ class TranscriptionPipeline:
         audio_path: str,
         segments: list[dict],
         num_speakers: int | None = None,
+        on_status: callable | None = None,
     ) -> list[dict]:
         """Assign speaker labels at word level, then group into segments."""
-        diarizer = self._load_diarizer()
+        diarizer = self._load_diarizer(on_status=on_status)
 
         kwargs: dict = {}
         if num_speakers:
             kwargs["num_speakers"] = num_speakers
+            diarize_hint = f"Running diarization with num_speakers={num_speakers}"
+        else:
+            diarize_hint = "Running diarization with automatic speaker count"
+        _emit_status(
+            on_status,
+            "diarize",
+            "Speaker diarization",
+            diarize_hint,
+        )
         annotation = diarizer(audio_path, **kwargs)
 
         # pyannote 4.x wraps the result in DiarizeOutput
@@ -260,6 +379,12 @@ class TranscriptionPipeline:
             (turn.start, turn.end, spk)
             for turn, _, spk in diarization.itertracks(yield_label=True)
         ]
+        _emit_status(
+            on_status,
+            "diarize",
+            "Speaker diarization",
+            f"Matching transcript words to {len(speaker_turns)} speaker turns",
+        )
 
         # Assign speaker to each word individually
         labeled_words: list[dict] = []
@@ -307,6 +432,12 @@ class TranscriptionPipeline:
 
         # Group consecutive words by speaker into segments
         if not labeled_words:
+            _emit_status(
+                on_status,
+                "diarize",
+                "Speaker diarization",
+                "No words were available for speaker assignment",
+            )
             return []
 
         grouped: list[dict] = []
@@ -333,7 +464,17 @@ class TranscriptionPipeline:
                 }
         grouped.append(cur)
 
-        return self._merge_consecutive(grouped)
+        merged = self._merge_consecutive(grouped)
+        _emit_status(
+            on_status,
+            "diarize",
+            "Speaker diarization",
+            (
+                f"Built {len(merged)} speaker segments from "
+                f"{len(labeled_words)} labeled words"
+            ),
+        )
+        return merged
 
     # ── post-processing ───────────────────────────────────────────────────────
 
@@ -382,34 +523,59 @@ class TranscriptionPipeline:
         language: str | None = None,
         num_speakers: int | None = None,
         llm_postprocess: bool = False,
-        on_progress: callable | None = None,
+        on_status: callable | None = None,
     ) -> list[dict]:
         """Run transcription + diarization and return merged labeled segments."""
+        _emit_status(
+            on_status,
+            "audio",
+            "Audio preparation",
+            "Loading source audio and converting it to 16 kHz mono",
+        )
         audio_np = _load_audio_np(audio_path)
+        _emit_status(
+            on_status,
+            "audio",
+            "Audio preparation",
+            (
+                f"Loaded {len(audio_np):,} samples "
+                f"({len(audio_np) / SAMPLE_RATE:.1f}s of audio)"
+            ),
+        )
 
-        if on_progress:
-            on_progress(0.10, "Transcribing audio (MLX-Whisper)…")
-        segments = self.transcribe(audio_np, language=language)
+        segments = self.transcribe(audio_np, language=language, on_status=on_status)
 
-        if on_progress:
-            on_progress(0.50, "Identifying speakers (pyannote)…")
+        _emit_status(
+            on_status,
+            "wav_export",
+            "Temporary WAV export",
+            "Preparing a 16 kHz WAV copy for speaker diarization",
+        )
         wav_path = _to_wav16k(audio_path)
         try:
-            segments = self.diarize(wav_path, segments, num_speakers=num_speakers)
+            segments = self.diarize(
+                wav_path,
+                segments,
+                num_speakers=num_speakers,
+                on_status=on_status,
+            )
         finally:
             os.unlink(wav_path)
 
         if llm_postprocess:
-            if on_progress:
-                on_progress(0.75, "Post-processing with LLM…")
             from src.postprocess import postprocess_segments
             segments = postprocess_segments(
                 segments,
                 use_glossary=True,
                 glossary_path=self.glossary_path,
                 prompt_path=self.llm_prompt_path,
+                on_status=on_status,
             )
 
-        if on_progress:
-            on_progress(0.95, "Done!")
+        _emit_status(
+            on_status,
+            "finalize",
+            "Final transcript",
+            f"Prepared {len(segments)} transcript segments for display and export",
+        )
         return segments

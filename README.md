@@ -77,7 +77,7 @@ Models are downloaded automatically on first use and cached by HuggingFace Hub.
 
 ## LLM post-processing
 
-Enable the **"LLM post-processing"** checkbox in the UI to run a local LLM after transcription. This fixes:
+Enable the **"LLM post-processing"** checkbox in the UI to run a local LLM after transcription. It is disabled by default because the first run downloads about 4 GB and long recordings become much slower. This fixes:
 
 - Punctuation (commas, periods, question marks)
 - Capitalization of names and proper nouns

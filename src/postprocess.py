@@ -4,6 +4,8 @@ import os
 from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
 
+from src.model_cache import hf_repo_is_cached
+
 
 LLM_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 
@@ -63,9 +65,22 @@ def postprocess_segments(
     use_glossary: bool = True,
     glossary_path: str = "glossary.txt",
     prompt_path: str = "llm_prompt.txt",
-    on_progress: callable | None = None,
+    on_status: callable | None = None,
 ) -> list[dict]:
     """Run LLM post-processing on transcript segments."""
+    if on_status:
+        if hf_repo_is_cached(LLM_MODEL):
+            on_status(
+                "llm_model",
+                "LLM model",
+                f"Using cached model {LLM_MODEL}",
+            )
+        else:
+            on_status(
+                "llm_model",
+                "LLM model",
+                f"Downloading model {LLM_MODEL}",
+            )
     model, tokenizer = _get_model()
 
     glossary = _load_file(glossary_path) if use_glossary else ""
@@ -77,10 +92,23 @@ def postprocess_segments(
     prev_context = ""
     total = len(segments)
 
+    if total == 0:
+        if on_status:
+            on_status(
+                "llm",
+                "LLM post-processing",
+                "No transcript segments need post-processing",
+            )
+        return result
+
     for i, seg in enumerate(segments):
         text = seg["text"]
-        if on_progress and i % 3 == 0:
-            on_progress((i / total), f"Post-processing segment {i+1}/{total}...")
+        if on_status:
+            on_status(
+                "llm",
+                "LLM post-processing",
+                f"Post-processing segment {i+1}/{total} ({len(text)} chars)",
+            )
 
         prompt = _build_prompt(
             text,
@@ -113,4 +141,10 @@ def postprocess_segments(
         # Keep last segment as context for next
         prev_context = fixed[-200:] if len(fixed) > 200 else fixed
 
+    if on_status:
+        on_status(
+            "llm",
+            "LLM post-processing",
+            f"Finished AI cleanup for {total} segments",
+        )
     return result
