@@ -1,6 +1,5 @@
 """
 Transcriber – local audio transcription with speaker diarization.
-Runs on Apple Silicon via MLX (Whisper) + pyannote.audio (diarization).
 
 Usage:
     python app.py
@@ -10,6 +9,7 @@ Then open http://localhost:7860 in your browser.
 from __future__ import annotations
 
 import os
+import tempfile
 import traceback
 
 import gradio as gr
@@ -80,15 +80,16 @@ def _on_transcribe(audio_path, model_label, language_label, num_speakers, use_ll
     """
     Synchronous handler. Gradio's queue runs this in a thread automatically,
     keeping the event loop free for WebSocket heartbeats.
+    Returns (transcript_text, file_path).
     """
     if audio_path is None:
-        return "⚠️  Please upload an audio file."
+        return "⚠️  Please upload an audio file.", gr.update(value=None, visible=False)
 
     if not HF_TOKEN:
         return (
             "⚠️  HF_TOKEN not found.\n"
             "Add it to .env in the project root:\nHF_TOKEN=hf_..."
-        )
+        ), gr.update(value=None, visible=False)
 
     try:
         language = LANGUAGES.get(language_label)
@@ -101,11 +102,21 @@ def _on_transcribe(audio_path, model_label, language_label, num_speakers, use_ll
             num_speakers=n_spk,
             llm_postprocess=use_llm,
         )
-        return _fmt_display(segments)
+        txt = _fmt_display(segments)
+
+        # Write transcript to a temp file for download
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix="transcript_",
+            delete=False, encoding="utf-8",
+        )
+        tmp.write(txt)
+        tmp.close()
+
+        return txt, gr.update(value=tmp.name, visible=True)
 
     except Exception as exc:
         tb = traceback.format_exc()
-        return f"❌  Error:\n\n{exc}\n\n{tb}"
+        return f"❌  Error:\n\n{exc}\n\n{tb}", gr.update(value=None, visible=False)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -114,25 +125,10 @@ CSS = """
 #header     { text-align: center; margin-bottom: 8px; }
 #transcript { font-family: monospace; font-size: 13px; }
 #run-btn    { min-height: 48px; font-size: 16px; }
-#action-row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
-#action-row button {
-    width: 36px; height: 36px; padding: 0; font-size: 16px;
-    border: 1px solid #d1d5db; border-radius: 6px;
-    background: white; cursor: pointer; color: #374151;
-    display: flex; align-items: center; justify-content: center;
-    transition: background 0.15s;
-}
-#action-row button:hover { background: #f3f4f6; }
-#action-row button:active { background: #e5e7eb; }
 """
 
-# JS injected on page load:
-#  1. Patches Gradio's locale-dependent upload strings to English.
-#  2. Attaches native click handlers to icon buttons (copy / download),
-#     completely bypassing Gradio's event system for reliability.
 JS_INIT = """
 () => {
-    /* ── i18n patch ─────────────────────────────────────── */
     const PATCH = {
         'Перетащите аудио сюда': 'Drop audio file here',
         'Нажмите для загрузки':  'Click to upload',
@@ -148,57 +144,6 @@ JS_INIT = """
     }
     setTimeout(patchI18n, 300);
     setTimeout(patchI18n, 1500);
-
-    /* ── copy & download buttons (event delegation) ─────── */
-    /* Uses delegation on document so it survives Svelte re-renders. */
-    function getTxt() {
-        const ta = document.querySelector('#transcript textarea');
-        return ta ? ta.value : '';
-    }
-
-    function copyToClipboard(txt) {
-        if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(txt);
-        } else {
-            /* Fallback for non-HTTPS (e.g. 0.0.0.0:7860) */
-            const ta = document.createElement('textarea');
-            ta.value = txt;
-            ta.style.cssText = 'position:fixed;left:-9999px';
-            document.body.appendChild(ta);
-            ta.select();
-            document.execCommand('copy');
-            document.body.removeChild(ta);
-        }
-    }
-
-    /* Use CAPTURE phase so we fire BEFORE Gradio's own click handler
-       on the HTML wrapper (which calls trigger('click') and sends a
-       broken server request). stopPropagation prevents that. */
-    document.addEventListener('click', (e) => {
-        /* Copy button */
-        if (e.target.closest('#copy-btn')) {
-            e.stopPropagation();
-            e.preventDefault();
-            const txt = getTxt();
-            if (txt) copyToClipboard(txt);
-            return;
-        }
-        /* Download button */
-        if (e.target.closest('#dl-btn')) {
-            e.stopPropagation();
-            e.preventDefault();
-            const txt = getTxt();
-            if (!txt) return;
-            const blob = new Blob([txt], {type:'text/plain;charset=utf-8'});
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = 'transcript.txt';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(a.href);
-        }
-    }, true);  /* true = capture phase */
 }
 """
 
@@ -207,8 +152,7 @@ with gr.Blocks(title="Transcriber") as demo:
 
     gr.Markdown(
         "# 🎙 Transcriber\n"
-        "Local transcription with speaker diarization  \n"
-        "*(MLX-Whisper + pyannote.audio · Apple Silicon)*",
+        "Local transcription with speaker diarization",
         elem_id="header",
     )
 
@@ -237,7 +181,7 @@ with gr.Blocks(title="Transcriber") as demo:
                 )
             llm_toggle = gr.Checkbox(
                 label="LLM post-processing",
-                value=False,
+                value=True,
                 info="Fix names, terms, punctuation with AI",
             )
             run_btn = gr.Button(
@@ -254,11 +198,10 @@ with gr.Blocks(title="Transcriber") as demo:
                 placeholder="Results will appear here…",
                 elem_id="transcript",
             )
-            gr.HTML(
-                '<div id="action-row">'
-                '  <button id="copy-btn" title="Copy to clipboard">⧉</button>'
-                '  <button id="dl-btn" title="Download TXT">⬇</button>'
-                '</div>'
+            download_file = gr.File(
+                label="Download transcript",
+                visible=False,
+                interactive=False,
             )
 
     # ── wiring ────────────────────────────────────────────────────────────
@@ -266,10 +209,8 @@ with gr.Blocks(title="Transcriber") as demo:
     run_btn.click(
         fn=_on_transcribe,
         inputs=[audio_input, model_dd, lang_dd, spk_slider, llm_toggle],
-        outputs=[output_box],
+        outputs=[output_box, download_file],
     )
-    # Copy & download buttons are wired via native JS in JS_INIT —
-    # no Gradio event handlers needed (avoids fn=None/js bugs in Gradio 6).
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
