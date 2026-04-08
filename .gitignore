@@ -209,4 +209,6 @@ __marimo__/
 .claude/
 
 test/
-test.*  
+test.*
+glossary.txt
+llm_prompt.txt

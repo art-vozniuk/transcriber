@@ -76,7 +76,7 @@ def _fmt_display(segments: list[dict]) -> str:
 
 # ── main callback ─────────────────────────────────────────────────────────────
 
-def _on_transcribe(audio_path, model_label, language_label, num_speakers):
+def _on_transcribe(audio_path, model_label, language_label, num_speakers, use_llm):
     """
     Synchronous handler. Gradio's queue runs this in a thread automatically,
     keeping the event loop free for WebSocket heartbeats.
@@ -95,7 +95,12 @@ def _on_transcribe(audio_path, model_label, language_label, num_speakers):
         n_spk = int(num_speakers) if num_speakers > 0 else None
 
         pipe = _get_pipeline(model_label)
-        segments = pipe.run(audio_path, language=language, num_speakers=n_spk)
+        segments = pipe.run(
+            audio_path,
+            language=language,
+            num_speakers=n_spk,
+            llm_postprocess=use_llm,
+        )
         return _fmt_display(segments)
 
     except Exception as exc:
@@ -230,6 +235,11 @@ with gr.Blocks(title="Transcriber") as demo:
                     label="Speakers (0 = auto)",
                     minimum=0, maximum=10, step=1, value=0,
                 )
+            llm_toggle = gr.Checkbox(
+                label="LLM post-processing",
+                value=False,
+                info="Fix names, terms, punctuation with AI",
+            )
             run_btn = gr.Button(
                 "▶  Transcribe",
                 variant="primary",
@@ -255,7 +265,7 @@ with gr.Blocks(title="Transcriber") as demo:
 
     run_btn.click(
         fn=_on_transcribe,
-        inputs=[audio_input, model_dd, lang_dd, spk_slider],
+        inputs=[audio_input, model_dd, lang_dd, spk_slider, llm_toggle],
         outputs=[output_box],
     )
     # Copy & download buttons are wired via native JS in JS_INIT —

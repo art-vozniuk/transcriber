@@ -75,9 +75,13 @@ class TranscriptionPipeline:
         self,
         hf_token: str,
         whisper_model: str = "mlx-community/whisper-large-v3-mlx",
+        glossary_path: str = "glossary.txt",
+        llm_prompt_path: str = "llm_prompt.txt",
     ) -> None:
         self.hf_token = hf_token
         self.whisper_model = whisper_model
+        self.glossary_path = glossary_path
+        self.llm_prompt_path = llm_prompt_path
         self._diarizer: PyannotePipeline | None = None
 
     # ── VAD ─────────────────────────────────────────────────────────────────────
@@ -111,16 +115,46 @@ class TranscriptionPipeline:
 
     # ── transcription ─────────────────────────────────────────────────────────
 
+    def _build_prompt(self, language: str | None) -> str | None:
+        """Build initial_prompt from punctuation example + glossary terms."""
+        PROMPTS = {
+            "ru": "Привет! Как дела? Да, всё хорошо. Ну, в общем, вот так.",
+            "en": "Hello! How are you? Yes, everything is fine. Well, that's how it is.",
+        }
+        parts = []
+        if language and language in PROMPTS:
+            parts.append(PROMPTS[language])
+
+        # Add glossary terms (extract short names only, ~200 token budget)
+        if os.path.exists(self.glossary_path):
+            with open(self.glossary_path) as f:
+                raw = f.read().strip()
+            # Extract just the term names, skip descriptions in parentheses
+            terms = []
+            for entry in raw.split(","):
+                entry = entry.strip()
+                if "(" in entry:
+                    entry = entry[:entry.index("(")].strip()
+                if entry:
+                    terms.append(entry)
+            # Deduplicate and limit to fit ~200 tokens
+            seen = set()
+            unique = []
+            for t in terms:
+                if t not in seen:
+                    seen.add(t)
+                    unique.append(t)
+            glossary_str = ", ".join(unique[:80])
+            if glossary_str:
+                parts.append(glossary_str)
+
+        return " ".join(parts) if parts else None
+
     def transcribe(self, audio: np.ndarray, language: str | None = None) -> list[dict]:
         """
         Run Silero VAD to find speech chunks, then transcribe each chunk
         with MLX-Whisper. This produces shorter, more accurate segments.
         """
-        PROMPTS = {
-            "ru": "Привет! Как дела? Да, всё хорошо. Ну, в общем, вот так.",
-            "en": "Hello! How are you? Yes, everything is fine. Well, that's how it is.",
-        }
-
         base_kwargs: dict = {
             "path_or_hf_repo": self.whisper_model,
             "word_timestamps": True,
@@ -129,8 +163,10 @@ class TranscriptionPipeline:
         }
         if language:
             base_kwargs["language"] = language
-            if language in PROMPTS:
-                base_kwargs["initial_prompt"] = PROMPTS[language]
+
+        prompt = self._build_prompt(language)
+        if prompt:
+            base_kwargs["initial_prompt"] = prompt
 
         # Get speech regions via VAD
         vad_regions = self._get_vad_segments(audio)
@@ -345,25 +381,34 @@ class TranscriptionPipeline:
         audio_path: str,
         language: str | None = None,
         num_speakers: int | None = None,
+        llm_postprocess: bool = False,
         on_progress: callable | None = None,
     ) -> list[dict]:
         """Run transcription + diarization and return merged labeled segments."""
-        # Load audio once with torchaudio – no ffmpeg needed for any format.
         audio_np = _load_audio_np(audio_path)
 
         if on_progress:
-            on_progress(0.15, "Transcribing audio (MLX-Whisper)…")
-        # Pass numpy array directly; mlx_whisper skips its ffmpeg loader.
+            on_progress(0.10, "Transcribing audio (MLX-Whisper)…")
         segments = self.transcribe(audio_np, language=language)
 
         if on_progress:
-            on_progress(0.60, "Identifying speakers (pyannote)…")
-        # pyannote needs a WAV file path, so write a temp file.
+            on_progress(0.50, "Identifying speakers (pyannote)…")
         wav_path = _to_wav16k(audio_path)
         try:
             segments = self.diarize(wav_path, segments, num_speakers=num_speakers)
         finally:
             os.unlink(wav_path)
+
+        if llm_postprocess:
+            if on_progress:
+                on_progress(0.75, "Post-processing with LLM…")
+            from src.postprocess import postprocess_segments
+            segments = postprocess_segments(
+                segments,
+                use_glossary=True,
+                glossary_path=self.glossary_path,
+                prompt_path=self.llm_prompt_path,
+            )
 
         if on_progress:
             on_progress(0.95, "Done!")
