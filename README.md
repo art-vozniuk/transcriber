@@ -1,5 +1,7 @@
 # 🎙 Transcriber
 
+<img width="1515" height="910" alt="image" src="https://github.com/user-attachments/assets/041ee605-3038-438e-b830-f76c49233b77" />
+
 Local audio transcription with speaker diarization, optimized for Apple Silicon.
 
 - **ASR** — [MLX-Whisper](https://github.com/ml-explore/mlx-examples) (large-v3 / turbo / medium) via Apple's MLX framework
